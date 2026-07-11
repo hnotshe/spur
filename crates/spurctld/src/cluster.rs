@@ -170,7 +170,8 @@ pub enum PreemptOutcome {
 /// State recovery happens through Raft log replay (via `StateMachineApply`).
 pub struct ClusterManager {
     pub config: SlurmConfig,
-    /// Path to the spur.conf file, used for best-effort writeback after partition CRUD.
+    /// Path to the spur.conf file, re-read by `reconfigure()`. spur.conf is
+    /// never written back — the Raft WAL is the sole source of runtime truth.
     /// None when running without a config file (e.g. in tests).
     config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
@@ -253,8 +254,8 @@ impl ClusterManager {
         apply_default_partition(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
-        self.validate_partition(&spec)?;
         apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
+        self.validate_partition(&spec)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -310,11 +311,20 @@ impl ClusterManager {
         };
 
         if !part.allow_qos.is_empty() {
-            let qos = spec.qos.as_deref().unwrap_or("");
-            if !part.allow_qos.iter().any(|q| q == qos) {
-                return Err(SubmitError::invalid(format!(
-                    "QoS '{qos}' not allowed on partition '{partition_name}'"
-                )));
+            match spec.qos.as_deref().filter(|q| !q.is_empty()) {
+                Some(qos) if part.allow_qos.iter().any(|q| q == qos) => {}
+                Some(qos) => {
+                    return Err(SubmitError::invalid(format!(
+                        "QoS '{qos}' not allowed on partition '{partition_name}' (allowed: {})",
+                        part.allow_qos.join(", ")
+                    )));
+                }
+                None => {
+                    return Err(SubmitError::invalid(format!(
+                        "a QoS is required on partition '{partition_name}' (allowed: {})",
+                        part.allow_qos.join(", ")
+                    )));
+                }
             }
         }
 
@@ -2197,7 +2207,6 @@ impl ClusterManager {
         is_default: Option<bool>,
         max_time: Option<String>,
         default_time: Option<String>,
-        clear_max_time: bool,
         max_nodes: Option<u32>,
         clear_max_nodes: bool,
         min_nodes: Option<u32>,
@@ -2205,6 +2214,7 @@ impl ClusterManager {
         allow_groups: Option<Vec<String>>,
         deny_accounts: Option<Vec<String>>,
         deny_qos: Option<Vec<String>>,
+        allow_qos: Option<Vec<String>>,
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
     ) -> Result<(), PartitionError> {
@@ -2215,9 +2225,7 @@ impl ClusterManager {
             )));
         }
 
-        let max_time_minutes = if clear_max_time {
-            Some(None)
-        } else if let Some(ref t) = max_time {
+        let max_time_minutes = if let Some(ref t) = max_time {
             if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
                 Some(None)
             } else {
@@ -2233,8 +2241,9 @@ impl ClusterManager {
             if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
                 Some(None)
             } else {
-                let m = spur_core::config::parse_time_minutes(t)
-                    .ok_or_else(|| PartitionError::invalid(format!("invalid default_time: {}", t)))?;
+                let m = spur_core::config::parse_time_minutes(t).ok_or_else(|| {
+                    PartitionError::invalid(format!("invalid default_time: {}", t))
+                })?;
                 Some(Some(m))
             }
         } else {
@@ -2260,6 +2269,7 @@ impl ClusterManager {
             allow_groups,
             deny_accounts,
             deny_qos,
+            allow_qos,
             priority_tier,
             preempt_mode,
             is_default,
@@ -2306,15 +2316,19 @@ impl ClusterManager {
     /// overwritten by the incoming conf values.
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
-            anyhow::bail!("no config file path configured — reconfigure is a no-op");
+            anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
         let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
             conf_partitions.iter().map(|p| p.name.clone()).collect();
-        let current_names: std::collections::HashSet<String> =
-            self.partitions.read().iter().map(|p| p.name.clone()).collect();
+        let current_names: std::collections::HashSet<String> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
 
         // Delete partitions absent from the new conf.
         for name in current_names.difference(&conf_names) {
@@ -2337,23 +2351,24 @@ impl ClusterManager {
                 .map_err(|e| anyhow::anyhow!("reconfigure: delete {name}: {e}"))?;
         }
 
-        // Clear tombstones for partitions that reappear in conf so they are
-        // re-seeded by build_partitions() on the next restart.
-        {
-            let mut deleted = self.deleted_partition_names.write();
-            for name in &conf_names {
-                deleted.remove(name);
-            }
-        }
-
         // Create partitions present in conf but absent from current WAL state.
-        for part in conf_partitions.iter().filter(|p| !current_names.contains(&p.name)) {
-            self.propose(WalOperation::PartitionCreate { partition: part.clone() })
-                .map_err(|e| anyhow::anyhow!("reconfigure: create {}: {e}", part.name))?;
+        // `WalOperation::PartitionCreate`'s own apply already clears any
+        // tombstone for the name being (re)created — no separate step needed.
+        for part in conf_partitions
+            .iter()
+            .filter(|p| !current_names.contains(&p.name))
+        {
+            self.propose(WalOperation::PartitionCreate {
+                partition: part.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("reconfigure: create {}: {e}", part.name))?;
         }
 
         // Update partitions present in both — conf wins unconditionally.
-        for part in conf_partitions.iter().filter(|p| current_names.contains(&p.name)) {
+        for part in conf_partitions
+            .iter()
+            .filter(|p| current_names.contains(&p.name))
+        {
             let preempt_str = match part.preempt_mode {
                 spur_core::partition::PreemptMode::Cancel => "cancel",
                 spur_core::partition::PreemptMode::Requeue => "requeue",
@@ -2373,6 +2388,7 @@ impl ClusterManager {
                 allow_groups: Some(part.allow_groups.clone()),
                 deny_accounts: Some(part.deny_accounts.clone()),
                 deny_qos: Some(part.deny_qos.clone()),
+                allow_qos: Some(part.allow_qos.clone()),
                 priority_tier: Some(part.priority_tier),
                 preempt_mode: Some(preempt_str.to_string()),
                 is_default: Some(part.is_default),
@@ -3698,21 +3714,34 @@ impl ClusterManager {
                 // A create always clears any tombstone for this name — the admin
                 // is explicitly recreating a previously-deleted partition.
                 self.deleted_partition_names.write().remove(&partition.name);
-                let mut partitions = self.partitions.write();
-                if partitions.iter().any(|p| p.name == partition.name) {
-                    warn!(
-                        name = %partition.name,
-                        "duplicate partition create in WAL apply, ignoring"
-                    );
-                } else {
-                    partitions.push(partition.clone());
-                    response.partition_created = true;
-                    info!(name = %partition.name, "partition created");
+                {
+                    let mut partitions = self.partitions.write();
+                    if partitions.iter().any(|p| p.name == partition.name) {
+                        warn!(
+                            name = %partition.name,
+                            "duplicate partition create in WAL apply, ignoring"
+                        );
+                    } else {
+                        // Promote exactly one default: clear all others when
+                        // the new partition is created as the default.
+                        if partition.is_default {
+                            for p in partitions.iter_mut() {
+                                p.is_default = false;
+                            }
+                        }
+                        partitions.push(partition.clone());
+                        response.partition_created = true;
+                        info!(name = %partition.name, "partition created");
+                    }
                 }
+                // Node-to-partition membership is derived from the partition
+                // table (nodes/selector match), so a create can immediately
+                // change which partitions already-registered nodes belong to.
+                self.reconcile_partitions(&mut nodes);
             }
             WalOperation::PartitionUpdate {
                 name,
-                nodes,
+                nodes: new_hostlist,
                 selector,
                 state,
                 max_time_minutes,
@@ -3723,88 +3752,101 @@ impl ClusterManager {
                 allow_groups,
                 deny_accounts,
                 deny_qos,
+                allow_qos,
                 priority_tier,
                 preempt_mode,
                 is_default,
             } => {
-                let mut partitions = self.partitions.write();
-                let set_as_default = *is_default == Some(true);
-                if let Some(part) = partitions.iter_mut().find(|p| p.name == *name) {
-                    if let Some(n) = nodes {
-                        part.nodes = n.clone();
+                {
+                    let mut partitions = self.partitions.write();
+                    let set_as_default = *is_default == Some(true);
+                    if let Some(part) = partitions.iter_mut().find(|p| p.name == *name) {
+                        if let Some(n) = new_hostlist {
+                            part.nodes = n.clone();
+                        }
+                        if let Some(sel) = selector {
+                            part.selector = sel.clone();
+                        }
+                        if let Some(s) = state {
+                            part.state = match s.to_uppercase().as_str() {
+                                "UP" => spur_core::partition::PartitionState::Up,
+                                "DOWN" => spur_core::partition::PartitionState::Down,
+                                "DRAIN" => spur_core::partition::PartitionState::Drain,
+                                _ => spur_core::partition::PartitionState::Inactive,
+                            };
+                        }
+                        if let Some(mt) = max_time_minutes {
+                            part.max_time_minutes = *mt;
+                        }
+                        if let Some(dt) = default_time_minutes {
+                            part.default_time_minutes = *dt;
+                        }
+                        if let Some(mn) = max_nodes {
+                            part.max_nodes = *mn;
+                        }
+                        if let Some(mn) = min_nodes {
+                            part.min_nodes = *mn;
+                        }
+                        if let Some(aa) = allow_accounts {
+                            part.allow_accounts = aa.clone();
+                        }
+                        if let Some(ag) = allow_groups {
+                            part.allow_groups = ag.clone();
+                        }
+                        if let Some(da) = deny_accounts {
+                            part.deny_accounts = da.clone();
+                        }
+                        if let Some(dq) = deny_qos {
+                            part.deny_qos = dq.clone();
+                        }
+                        if let Some(aq) = allow_qos {
+                            part.allow_qos = aq.clone();
+                        }
+                        if let Some(pt) = priority_tier {
+                            part.priority_tier = *pt;
+                        }
+                        if let Some(pm) = preempt_mode {
+                            part.preempt_mode = match pm.to_lowercase().as_str() {
+                                "cancel" => spur_core::partition::PreemptMode::Cancel,
+                                "requeue" => spur_core::partition::PreemptMode::Requeue,
+                                "suspend" => spur_core::partition::PreemptMode::Suspend,
+                                _ => spur_core::partition::PreemptMode::Off,
+                            };
+                        }
+                        if let Some(def) = is_default {
+                            part.is_default = *def;
+                        }
+                        info!(name, "partition updated");
+                    } else {
+                        warn!(name, "partition update for unknown partition, ignoring");
                     }
-                    if let Some(sel) = selector {
-                        part.selector = sel.clone();
-                    }
-                    if let Some(s) = state {
-                        part.state = match s.to_uppercase().as_str() {
-                            "UP" => spur_core::partition::PartitionState::Up,
-                            "DOWN" => spur_core::partition::PartitionState::Down,
-                            "DRAIN" => spur_core::partition::PartitionState::Drain,
-                            _ => spur_core::partition::PartitionState::Inactive,
-                        };
-                    }
-                    if let Some(mt) = max_time_minutes {
-                        part.max_time_minutes = *mt;
-                    }
-                    if let Some(dt) = default_time_minutes {
-                        part.default_time_minutes = *dt;
-                    }
-                    if let Some(mn) = max_nodes {
-                        part.max_nodes = *mn;
-                    }
-                    if let Some(mn) = min_nodes {
-                        part.min_nodes = *mn;
-                    }
-                    if let Some(aa) = allow_accounts {
-                        part.allow_accounts = aa.clone();
-                    }
-                    if let Some(ag) = allow_groups {
-                        part.allow_groups = ag.clone();
-                    }
-                    if let Some(da) = deny_accounts {
-                        part.deny_accounts = da.clone();
-                    }
-                    if let Some(dq) = deny_qos {
-                        part.deny_qos = dq.clone();
-                    }
-                    if let Some(pt) = priority_tier {
-                        part.priority_tier = *pt;
-                    }
-                    if let Some(pm) = preempt_mode {
-                        part.preempt_mode = match pm.to_lowercase().as_str() {
-                            "cancel" => spur_core::partition::PreemptMode::Cancel,
-                            "requeue" => spur_core::partition::PreemptMode::Requeue,
-                            "suspend" => spur_core::partition::PreemptMode::Suspend,
-                            _ => spur_core::partition::PreemptMode::Off,
-                        };
-                    }
-                    if let Some(def) = is_default {
-                        part.is_default = *def;
-                    }
-                    info!(name, "partition updated");
-                } else {
-                    warn!(name, "partition update for unknown partition, ignoring");
-                }
-                // Promote exactly one default: clear all others when this one was set.
-                if set_as_default {
-                    for p in partitions.iter_mut() {
-                        if p.name != *name {
-                            p.is_default = false;
+                    // Promote exactly one default: clear all others when this one was set.
+                    if set_as_default {
+                        for p in partitions.iter_mut() {
+                            if p.name != *name {
+                                p.is_default = false;
+                            }
                         }
                     }
                 }
+                // Node/selector may have changed which nodes this partition covers.
+                self.reconcile_partitions(&mut nodes);
             }
             WalOperation::PartitionDelete { name } => {
-                let mut partitions = self.partitions.write();
-                let len_before = partitions.len();
-                partitions.retain(|p| p.name != *name);
-                if partitions.len() < len_before {
-                    // Record the tombstone so this name is suppressed from the
-                    // spur.conf baseline on the next restart.
-                    self.deleted_partition_names.write().insert(name.clone());
-                    info!(name, "partition deleted");
+                {
+                    let mut partitions = self.partitions.write();
+                    let len_before = partitions.len();
+                    partitions.retain(|p| p.name != *name);
+                    if partitions.len() < len_before {
+                        // Record the tombstone so this name is suppressed from the
+                        // spur.conf baseline on the next restart.
+                        self.deleted_partition_names.write().insert(name.clone());
+                        info!(name, "partition deleted");
+                    }
                 }
+                // A node whose partition was deleted needs to fall back to
+                // another matching partition (or the cluster default).
+                self.reconcile_partitions(&mut nodes);
             }
             WalOperation::ReservationCreate { reservation } => {
                 let mut reservations = self.reservations.write();
@@ -4560,6 +4602,7 @@ mod tests {
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             }],
@@ -6870,7 +6913,10 @@ mod tests {
 
         let mut spec = basic_spec("nocache");
         spec.account = Some("student".into());
-        assert!(cm.submit_job(spec).is_err(), "unlisted account must be rejected");
+        assert!(
+            cm.submit_job(spec).is_err(),
+            "unlisted account must be rejected"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9444,6 +9490,7 @@ mod tests {
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             },
@@ -9461,6 +9508,7 @@ mod tests {
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
                 deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             },
@@ -9519,6 +9567,7 @@ mod tests {
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
         }];
@@ -10147,7 +10196,10 @@ mod tests {
         });
 
         let parts = cm.get_partitions();
-        assert!(parts.iter().any(|p| p.name == "gpu"), "gpu partition missing after create");
+        assert!(
+            parts.iter().any(|p| p.name == "gpu"),
+            "gpu partition missing after create"
+        );
         let gpu = parts.iter().find(|p| p.name == "gpu").unwrap();
         assert_eq!(gpu.max_time_minutes, Some(1440));
         assert_eq!(gpu.allow_accounts, vec!["ml-team"]);
@@ -10166,12 +10218,17 @@ mod tests {
             allow_groups: None,
             deny_accounts: None,
             deny_qos: None,
+            allow_qos: None,
             priority_tier: None,
             preempt_mode: None,
             is_default: None,
         });
 
-        let gpu = cm.get_partitions().into_iter().find(|p| p.name == "gpu").unwrap();
+        let gpu = cm
+            .get_partitions()
+            .into_iter()
+            .find(|p| p.name == "gpu")
+            .unwrap();
         assert_eq!(gpu.state, spur_core::partition::PartitionState::Drain);
         assert_eq!(gpu.max_time_minutes, Some(2880));
         assert!(gpu.allow_accounts.contains(&"infra".into()));
@@ -10195,8 +10252,15 @@ mod tests {
             partition: gpu_partition(),
         });
 
-        let gpu_count = cm.get_partitions().iter().filter(|p| p.name == "gpu").count();
-        assert_eq!(gpu_count, 1, "duplicate PartitionCreate must not add a second entry");
+        let gpu_count = cm
+            .get_partitions()
+            .iter()
+            .filter(|p| p.name == "gpu")
+            .count();
+        assert_eq!(
+            gpu_count, 1,
+            "duplicate PartitionCreate must not add a second entry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10218,12 +10282,17 @@ mod tests {
             allow_groups: None,
             deny_accounts: None,
             deny_qos: None,
+            allow_qos: None,
             priority_tier: None,
             preempt_mode: None,
             is_default: None,
         });
 
-        assert_eq!(cm.get_partitions().len(), before, "unknown partition update must not add an entry");
+        assert_eq!(
+            cm.get_partitions().len(),
+            before,
+            "unknown partition update must not add an entry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10235,7 +10304,13 @@ mod tests {
         cm.apply_operation(&WalOperation::PartitionCreate {
             partition: gpu_partition(),
         });
-        assert!(!cm.get_partitions().iter().find(|p| p.name == "gpu").unwrap().is_default);
+        assert!(
+            !cm.get_partitions()
+                .iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .is_default
+        );
 
         // Make "gpu" the default.
         cm.apply_operation(&WalOperation::PartitionUpdate {
@@ -10251,14 +10326,23 @@ mod tests {
             allow_groups: None,
             deny_accounts: None,
             deny_qos: None,
+            allow_qos: None,
             priority_tier: None,
             preempt_mode: None,
             is_default: Some(true),
         });
 
         let parts = cm.get_partitions();
-        let defaults: Vec<&str> = parts.iter().filter(|p| p.is_default).map(|p| p.name.as_str()).collect();
-        assert_eq!(defaults, vec!["gpu"], "exactly one partition must be default after promotion");
+        let defaults: Vec<&str> = parts
+            .iter()
+            .filter(|p| p.is_default)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            defaults,
+            vec!["gpu"],
+            "exactly one partition must be default after promotion"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10307,8 +10391,13 @@ mod tests {
         spec.partition = Some("gpu".into());
         let job_id = submit_and_wait(&cm, spec);
         let alloc = scalar_alloc(1, 1000);
-        cm.start_job(job_id, vec!["n1".into()], alloc.clone(), per_node_for(&["n1"], alloc))
-            .unwrap();
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Running);
 
         let err = cm.delete_partition("gpu").unwrap_err();
@@ -10333,7 +10422,11 @@ mod tests {
         wait_for("gpu replayed from WAL", || {
             cm2.get_partitions().iter().any(|p| p.name == "gpu")
         });
-        let gpu = cm2.get_partitions().into_iter().find(|p| p.name == "gpu").unwrap();
+        let gpu = cm2
+            .get_partitions()
+            .into_iter()
+            .find(|p| p.name == "gpu")
+            .unwrap();
         assert_eq!(gpu.allow_accounts, vec!["ml-team"]);
     }
 
@@ -10353,7 +10446,11 @@ mod tests {
             1,
             "exactly one concurrent create must succeed"
         );
-        let gpu_count = cm.get_partitions().iter().filter(|p| p.name == "gpu").count();
+        let gpu_count = cm
+            .get_partitions()
+            .iter()
+            .filter(|p| p.name == "gpu")
+            .count();
         assert_eq!(gpu_count, 1);
     }
 
@@ -10404,15 +10501,21 @@ mod tests {
         let cm = test_cluster(&state_dir).await;
 
         cm.create_partition(gpu_partition()).unwrap();
-        wait_for("gpu created", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        wait_for("gpu created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
 
         cm.delete_partition("gpu").unwrap();
-        wait_for("gpu deleted", || !cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        wait_for("gpu deleted", || {
+            !cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
         assert!(cm.deleted_partition_names.read().contains("gpu"));
 
         // Recreate.
         cm.create_partition(gpu_partition()).unwrap();
-        wait_for("gpu recreated", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        wait_for("gpu recreated", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
 
         assert!(
             !cm.deleted_partition_names.read().contains("gpu"),
